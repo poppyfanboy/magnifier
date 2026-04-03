@@ -4,16 +4,235 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <wincodec.h>
+#include <magnification.h>
 
 #include <GL/gl.h>
 #include <glcorearb.h>
 #include <wglext.h>
 
+#define SCREEN_RECORD_DEFAULT_METHOD SCREEN_RECORDING_VIA_WDA_EXCLUDEFROMCAPTURE
 #define MAGNIFIER_SIZE 256
 
 #define SRC(...) #__VA_ARGS__
 
 typedef uint32_t u32;
+
+typedef enum {
+    // Faster, but excluded windows will be hidden in screen recording (e.g. with OBS).
+    SCREEN_RECORDING_VIA_WDA_EXCLUDEFROMCAPTURE,
+
+    // Slower, but excluded windows are still visible in screen recording.
+    SCREEN_RECORDING_VIA_MAGNIFICATION_API,
+} ScreenRecordingMethod;
+
+typedef struct {
+    ScreenRecordingMethod method;
+
+    u32 *destination_image;
+    int width;
+    int height;
+
+    // Fields specific to the "Magnification API" method:
+    HWND magnifier_window;
+} ScreenRecorder;
+
+BOOL magnification_api_scaling_callback(
+    HWND window,
+    void *source_data,
+    MAGIMAGEHEADER source_header,
+    void *destination_data,
+    MAGIMAGEHEADER destination_header,
+    RECT unclipped,
+    RECT clipped,
+    HRGN dirty
+) {
+    HWND magnifier_window = GetAncestor(window, GA_PARENT);
+    ScreenRecorder *recorder = (ScreenRecorder *)GetWindowLongPtr(magnifier_window, GWLP_USERDATA);
+
+    if (IsEqualGUID(&source_header.format, &GUID_WICPixelFormat32bppRGBA)) {
+        memcpy(
+            recorder->destination_image,
+            source_data,
+            recorder->width * recorder->height * sizeof(u32)
+        );
+    }
+
+    return TRUE;
+}
+
+bool screen_recorder_create(
+    ScreenRecordingMethod method,
+    u32 *destination_image, int width, int height,
+    ScreenRecorder *recorder
+) {
+    recorder->method = method;
+
+    recorder->destination_image = destination_image;
+    recorder->width = width;
+    recorder->height = height;
+
+    if (recorder->method == SCREEN_RECORDING_VIA_WDA_EXCLUDEFROMCAPTURE) {
+        return true;
+    }
+
+    if (recorder->method == SCREEN_RECORDING_VIA_MAGNIFICATION_API) {
+        if (!MagInitialize()) {
+            return false;
+        }
+
+        HINSTANCE instance = GetModuleHandle(NULL);
+
+        WNDCLASS host_window_class = {
+            .style = CS_HREDRAW | CS_VREDRAW,
+            .lpfnWndProc = DefWindowProc,
+            .hInstance = instance,
+            .lpszClassName = L"Magnifier::MagnificationAPIHostWindow",
+        };
+        RegisterClass(&host_window_class);
+
+        DWORD host_window_style = WS_SYSMENU | WS_CLIPCHILDREN | WS_CAPTION;
+
+        RECT host_window_rect = {0, 0, recorder->width, recorder->height};
+        AdjustWindowRect(&host_window_rect, host_window_style, FALSE);
+
+        HWND host_window = CreateWindowEx(
+            WS_EX_TOPMOST | WS_EX_LAYERED,
+            host_window_class.lpszClassName,
+            L"Magnification API Host Window",
+            host_window_style,
+            0,
+            0,
+            host_window_rect.right - host_window_rect.left,
+            host_window_rect.bottom - host_window_rect.top,
+            NULL, NULL, host_window_class.hInstance, NULL
+        );
+        if (host_window == NULL) {
+            return false;
+        }
+
+        SetLayeredWindowAttributes(host_window, 0, 255, LWA_ALPHA);
+
+        recorder->magnifier_window = CreateWindowEx(
+            0,
+            WC_MAGNIFIER,
+            L"Magnification API Magnifier Child Window",
+            WS_CHILD | WS_VISIBLE,
+            0, 0,
+            MAGNIFIER_SIZE, MAGNIFIER_SIZE,
+            host_window, NULL, instance, NULL
+        );
+        if (recorder->magnifier_window == NULL) {
+            return false;
+        }
+
+        SetWindowLongPtr(recorder->magnifier_window, GWLP_USERDATA, (LONG_PTR)recorder);
+
+        // https://github.com/o3de/o3de/blob/8b6a218bf32586aaa2fa094c790056be2678ac0d/Code/Framework/AzQtComponents/AzQtComponents/Utilities/ScreenGrabber_win.cpp#L124-L131
+        // (On my machine everything works just fine even without calling ShowWindow.)
+        ShowWindow(host_window, SW_SHOWNORMAL);
+        GetWindowRect(host_window, &host_window_rect);
+        HRGN host_clip_region = CreateRectRgn(
+            host_window_rect.right - host_window_rect.left,
+            0,
+            host_window_rect.right - host_window_rect.left,
+            host_window_rect.bottom - host_window_rect.top
+        );
+        SetWindowRgn(host_window, host_clip_region, true);
+
+        MagSetImageScalingCallback(recorder->magnifier_window, magnification_api_scaling_callback);
+
+        return true;
+    }
+
+    return false;
+}
+
+void screen_recorder_exclude_window(ScreenRecorder *recorder, HWND window) {
+    switch (recorder->method) {
+        case SCREEN_RECORDING_VIA_WDA_EXCLUDEFROMCAPTURE: {
+            SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE);
+        } break;
+
+        case SCREEN_RECORDING_VIA_MAGNIFICATION_API: {
+            MagSetWindowFilterList(
+                recorder->magnifier_window,
+                MW_FILTERMODE_EXCLUDE,
+                1,
+                &window
+            );
+        } break;
+    }
+}
+
+void screen_recorder_snap_via_device_context(ScreenRecorder *recorder, int x, int y) {
+    HDC screen_device_context = GetDC(NULL);
+
+    HDC capture_device_context = CreateCompatibleDC(screen_device_context);
+    HBITMAP capture_bitmap = CreateCompatibleBitmap(
+        screen_device_context,
+        MAGNIFIER_SIZE,
+        MAGNIFIER_SIZE
+    );
+    HBITMAP capture_bitmap_old = SelectObject(capture_device_context, capture_bitmap);
+
+    BitBlt(
+        capture_device_context,
+        0, 0,
+        recorder->width, recorder->height,
+        screen_device_context,
+        x, y,
+        SRCCOPY
+    );
+
+    BITMAP capture_bitmap_description;
+    GetObject(capture_bitmap, sizeof(BITMAP), &capture_bitmap_description);
+
+    BITMAPINFO capture_bitmap_info = {
+        .bmiHeader = {
+            .biSize = sizeof(BITMAPINFOHEADER),
+            .biWidth = capture_bitmap_description.bmWidth,
+            .biHeight = -capture_bitmap_description.bmHeight,
+            .biPlanes = 1,
+            .biBitCount = 32,
+            .biCompression = BI_RGB,
+        },
+    };
+
+    GetDIBits(
+        capture_device_context,
+        capture_bitmap,
+        0,
+        capture_bitmap_description.bmHeight,
+        recorder->destination_image,
+        &capture_bitmap_info,
+        DIB_RGB_COLORS
+    );
+
+    SelectObject(capture_device_context, capture_bitmap_old);
+    DeleteObject(capture_bitmap);
+    DeleteDC(capture_device_context);
+
+    ReleaseDC(NULL, screen_device_context);
+}
+
+void screen_recorder_snap_via_magnification_api(ScreenRecorder *recorder, int x, int y) {
+    RECT source_rect = {x, y, x + recorder->width, y + recorder->height};
+    MagSetWindowSource(recorder->magnifier_window, source_rect);
+    InvalidateRect(recorder->magnifier_window, NULL, TRUE);
+}
+
+void screen_recorder_snap(ScreenRecorder *recorder, int x, int y) {
+    switch (recorder->method) {
+        case SCREEN_RECORDING_VIA_WDA_EXCLUDEFROMCAPTURE: {
+            screen_recorder_snap_via_device_context(recorder, x, y);
+        } break;
+
+        case SCREEN_RECORDING_VIA_MAGNIFICATION_API: {
+            screen_recorder_snap_via_magnification_api(recorder, x, y);
+        } break;
+    }
+}
 
 typedef struct {
     HWND window_handle;
@@ -349,6 +568,17 @@ int APIENTRY WinMain(
 ) {
     SetProcessDPIAware();
 
+    u32 *background_image = malloc(MAGNIFIER_SIZE * MAGNIFIER_SIZE * sizeof(u32));
+
+    ScreenRecorder screen_recorder;
+    if (!screen_recorder_create(
+        SCREEN_RECORD_DEFAULT_METHOD,
+        background_image, MAGNIFIER_SIZE, MAGNIFIER_SIZE,
+        &screen_recorder
+    )) {
+        return 1;
+    }
+
     int render_width = GetSystemMetrics(SM_CXSCREEN);
     int render_height = GetSystemMetrics(SM_CYSCREEN);
 
@@ -376,8 +606,6 @@ int APIENTRY WinMain(
         NULL, NULL, window_class.hInstance, NULL
     );
 
-    u32 *background_image = malloc(MAGNIFIER_SIZE * MAGNIFIER_SIZE * sizeof(u32));
-
     HBITMAP render_bitmap;
     u32 *render_image;
     {
@@ -402,10 +630,10 @@ int APIENTRY WinMain(
         ReleaseDC(window_handle, window_device_context);
     }
 
-    SetWindowDisplayAffinity(window_handle, WDA_EXCLUDEFROMCAPTURE);
-
     ShowWindow(window_handle, show_command);
     UpdateWindow(window_handle);
+
+    screen_recorder_exclude_window(&screen_recorder, window_handle);
 
     bool magnifier_is_dragged = false;
 
@@ -439,55 +667,9 @@ int APIENTRY WinMain(
             magnifier.position_y = cursor_position.y - MAGNIFIER_SIZE / 2;
         }
 
-        HDC screen_device_context = GetDC(NULL);
-        HDC window_device_context = GetDC(window_handle);
-
         // Capture a portion of the screen.
 
-        HDC capture_device_context = CreateCompatibleDC(screen_device_context);
-        HBITMAP capture_bitmap = CreateCompatibleBitmap(
-            screen_device_context,
-            MAGNIFIER_SIZE,
-            MAGNIFIER_SIZE
-        );
-        HBITMAP capture_bitmap_old = SelectObject(capture_device_context, capture_bitmap);
-
-        BitBlt(
-            capture_device_context,
-            0, 0,
-            MAGNIFIER_SIZE, MAGNIFIER_SIZE,
-            screen_device_context,
-            magnifier.position_x, magnifier.position_y,
-            SRCCOPY
-        );
-
-        BITMAP capture_bitmap_description;
-        GetObject(capture_bitmap, sizeof(BITMAP), &capture_bitmap_description);
-
-        BITMAPINFO capture_bitmap_info = {
-            .bmiHeader = {
-                .biSize = sizeof(BITMAPINFOHEADER),
-                .biWidth = capture_bitmap_description.bmWidth,
-                .biHeight = -capture_bitmap_description.bmHeight,
-                .biPlanes = 1,
-                .biBitCount = 32,
-                .biCompression = BI_RGB,
-            },
-        };
-
-        GetDIBits(
-            capture_device_context,
-            capture_bitmap,
-            0,
-            capture_bitmap_description.bmHeight,
-            background_image,
-            &capture_bitmap_info,
-            DIB_RGB_COLORS
-        );
-
-        SelectObject(capture_device_context, capture_bitmap_old);
-        DeleteObject(capture_bitmap);
-        DeleteDC(capture_device_context);
+        screen_recorder_snap(&screen_recorder, magnifier.position_x, magnifier.position_y);
 
         // Magnify the captured image.
 
@@ -495,6 +677,7 @@ int APIENTRY WinMain(
 
         // Render magnified image into the layered window.
 
+        HDC window_device_context = GetDC(window_handle);
         HDC render_device_context = CreateCompatibleDC(window_device_context);
         HBITMAP render_bitmap_old = SelectObject(render_device_context, render_bitmap);
 
@@ -527,9 +710,8 @@ int APIENTRY WinMain(
 
         SelectObject(render_device_context, render_bitmap_old);
         DeleteDC(render_device_context);
-
         ReleaseDC(window_handle, window_device_context);
-        ReleaseDC(NULL, screen_device_context);
+
         GdiFlush();
     }
 
