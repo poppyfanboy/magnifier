@@ -11,16 +11,30 @@
 #include <glcorearb.h>
 #include <wglext.h>
 
-#define SCREEN_RECORD_DEFAULT_METHOD SCREEN_RECORDING_VIA_WDA_EXCLUDEFROMCAPTURE
 #define MAGNIFIER_SIZE 256
+
+#ifndef SCREEN_RECORDING_METHOD
+    #define SCREEN_RECORDING_METHOD SCREEN_RECORDING_VIA_MAGNIFICATION_API
+#endif
 
 #define SRC(...) #__VA_ARGS__
 
+typedef uint8_t u8;
 typedef uint32_t u32;
+
+static inline int int_clamp(int value, int min, int max) {
+    if (value < min) {
+        return min;
+    } else if (value > max) {
+        return max;
+    } else {
+        return value;
+    }
+}
 
 typedef enum {
     // Faster, but excluded windows will be hidden in screen recording (e.g. with OBS).
-    SCREEN_RECORDING_VIA_WDA_EXCLUDEFROMCAPTURE,
+    SCREEN_RECORDING_VIA_DEVICE_CONTEXT,
 
     // Slower, but excluded windows are still visible in screen recording.
     SCREEN_RECORDING_VIA_MAGNIFICATION_API,
@@ -29,15 +43,20 @@ typedef enum {
 typedef struct {
     ScreenRecordingMethod method;
 
-    u32 *destination_image;
-    int width;
-    int height;
+    int screen_width;
+    int screen_height;
+    int screen_offset_x;
+    int screen_offset_y;
+
+    u32 *image;
+    int image_width;
+    int image_height;
 
     // Fields specific to the "Magnification API" method:
     HWND magnifier_window;
 } ScreenRecorder;
 
-BOOL magnification_api_scaling_callback(
+BOOL CALLBACK magnification_api_scaling_callback(
     HWND window,
     void *source_data,
     MAGIMAGEHEADER source_header,
@@ -51,11 +70,29 @@ BOOL magnification_api_scaling_callback(
     ScreenRecorder *recorder = (ScreenRecorder *)GetWindowLongPtr(magnifier_window, GWLP_USERDATA);
 
     if (IsEqualGUID(&source_header.format, &GUID_WICPixelFormat32bppRGBA)) {
-        memcpy(
-            recorder->destination_image,
-            source_data,
-            recorder->width * recorder->height * sizeof(u32)
+        int screen_from_x = int_clamp(recorder->screen_offset_x, 0, source_header.width);
+        int screen_to_x = int_clamp(
+            recorder->screen_offset_x + recorder->image_width,
+            0, source_header.width
         );
+
+        int image_x = screen_from_x - recorder->screen_offset_x;
+        int image_clipped_width = screen_to_x - screen_from_x;
+
+        int screen_from_y = int_clamp(recorder->screen_offset_y, 0, source_header.height);
+        int screen_to_y = int_clamp(
+            recorder->screen_offset_y + recorder->image_height,
+            0, source_header.height
+        );
+
+        for (int screen_y = screen_from_y; screen_y < screen_to_y; screen_y += 1) {
+            int image_y = screen_y - recorder->screen_offset_y;
+            memcpy(
+                &recorder->image[image_y * recorder->image_width + image_x],
+                &((u8 *)source_data)[screen_y * source_header.stride + screen_from_x * sizeof(u32)],
+                image_clipped_width * sizeof(u32)
+            );
+        }
     }
 
     return TRUE;
@@ -63,16 +100,23 @@ BOOL magnification_api_scaling_callback(
 
 bool screen_recorder_create(
     ScreenRecordingMethod method,
-    u32 *destination_image, int width, int height,
+    u32 *image,
+    int image_width,
+    int image_height,
     ScreenRecorder *recorder
 ) {
     recorder->method = method;
 
-    recorder->destination_image = destination_image;
-    recorder->width = width;
-    recorder->height = height;
+    recorder->screen_width = GetSystemMetrics(SM_CXSCREEN);
+    recorder->screen_height = GetSystemMetrics(SM_CYSCREEN);
+    recorder->screen_offset_x = 0;
+    recorder->screen_offset_y = 0;
 
-    if (recorder->method == SCREEN_RECORDING_VIA_WDA_EXCLUDEFROMCAPTURE) {
+    recorder->image = image;
+    recorder->image_width = image_width;
+    recorder->image_height = image_height;
+
+    if (recorder->method == SCREEN_RECORDING_VIA_DEVICE_CONTEXT) {
         return true;
     }
 
@@ -93,7 +137,7 @@ bool screen_recorder_create(
 
         DWORD host_window_style = WS_SYSMENU | WS_CLIPCHILDREN | WS_CAPTION;
 
-        RECT host_window_rect = {0, 0, recorder->width, recorder->height};
+        RECT host_window_rect = {0, 0, recorder->screen_width, recorder->screen_height};
         AdjustWindowRect(&host_window_rect, host_window_style, FALSE);
 
         HWND host_window = CreateWindowEx(
@@ -101,45 +145,26 @@ bool screen_recorder_create(
             host_window_class.lpszClassName,
             L"Magnification API Host Window",
             host_window_style,
-            0,
-            0,
+            host_window_rect.left,
+            host_window_rect.top,
             host_window_rect.right - host_window_rect.left,
             host_window_rect.bottom - host_window_rect.top,
             NULL, NULL, host_window_class.hInstance, NULL
         );
-        if (host_window == NULL) {
-            return false;
-        }
-
-        SetLayeredWindowAttributes(host_window, 0, 255, LWA_ALPHA);
 
         recorder->magnifier_window = CreateWindowEx(
             0,
             WC_MAGNIFIER,
             L"Magnification API Magnifier Child Window",
             WS_CHILD | WS_VISIBLE,
-            0, 0,
-            MAGNIFIER_SIZE, MAGNIFIER_SIZE,
+            0,
+            0,
+            recorder->screen_width,
+            recorder->screen_height,
             host_window, NULL, instance, NULL
         );
-        if (recorder->magnifier_window == NULL) {
-            return false;
-        }
 
         SetWindowLongPtr(recorder->magnifier_window, GWLP_USERDATA, (LONG_PTR)recorder);
-
-        // https://github.com/o3de/o3de/blob/8b6a218bf32586aaa2fa094c790056be2678ac0d/Code/Framework/AzQtComponents/AzQtComponents/Utilities/ScreenGrabber_win.cpp#L124-L131
-        // (On my machine everything works just fine even without calling ShowWindow.)
-        ShowWindow(host_window, SW_SHOWNORMAL);
-        GetWindowRect(host_window, &host_window_rect);
-        HRGN host_clip_region = CreateRectRgn(
-            host_window_rect.right - host_window_rect.left,
-            0,
-            host_window_rect.right - host_window_rect.left,
-            host_window_rect.bottom - host_window_rect.top
-        );
-        SetWindowRgn(host_window, host_clip_region, true);
-
         MagSetImageScalingCallback(recorder->magnifier_window, magnification_api_scaling_callback);
 
         return true;
@@ -150,7 +175,7 @@ bool screen_recorder_create(
 
 void screen_recorder_exclude_window(ScreenRecorder *recorder, HWND window) {
     switch (recorder->method) {
-        case SCREEN_RECORDING_VIA_WDA_EXCLUDEFROMCAPTURE: {
+        case SCREEN_RECORDING_VIA_DEVICE_CONTEXT: {
             SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE);
         } break;
 
@@ -179,7 +204,7 @@ void screen_recorder_snap_via_device_context(ScreenRecorder *recorder, int x, in
     BitBlt(
         capture_device_context,
         0, 0,
-        recorder->width, recorder->height,
+        MAGNIFIER_SIZE, MAGNIFIER_SIZE,
         screen_device_context,
         x, y,
         SRCCOPY
@@ -204,7 +229,7 @@ void screen_recorder_snap_via_device_context(ScreenRecorder *recorder, int x, in
         capture_bitmap,
         0,
         capture_bitmap_description.bmHeight,
-        recorder->destination_image,
+        recorder->image,
         &capture_bitmap_info,
         DIB_RGB_COLORS
     );
@@ -217,14 +242,19 @@ void screen_recorder_snap_via_device_context(ScreenRecorder *recorder, int x, in
 }
 
 void screen_recorder_snap_via_magnification_api(ScreenRecorder *recorder, int x, int y) {
-    RECT source_rect = {x, y, x + recorder->width, y + recorder->height};
+    recorder->screen_offset_x = x;
+    recorder->screen_offset_y = y;
+
+    // I tried sourcing just the rectangle I need to capture, but doing so would cause a tiny amount
+    // of jitter while moving the magnifier window around. Sourcing the entire screen and then
+    // copying the rectangle of interest inside of the callback seems to fix this problem.
+    RECT source_rect = {0, 0, recorder->screen_width, recorder->screen_height};
     MagSetWindowSource(recorder->magnifier_window, source_rect);
-    InvalidateRect(recorder->magnifier_window, NULL, TRUE);
 }
 
 void screen_recorder_snap(ScreenRecorder *recorder, int x, int y) {
     switch (recorder->method) {
-        case SCREEN_RECORDING_VIA_WDA_EXCLUDEFROMCAPTURE: {
+        case SCREEN_RECORDING_VIA_DEVICE_CONTEXT: {
             screen_recorder_snap_via_device_context(recorder, x, y);
         } break;
 
@@ -572,7 +602,7 @@ int APIENTRY WinMain(
 
     ScreenRecorder screen_recorder;
     if (!screen_recorder_create(
-        SCREEN_RECORD_DEFAULT_METHOD,
+        SCREEN_RECORDING_METHOD,
         background_image, MAGNIFIER_SIZE, MAGNIFIER_SIZE,
         &screen_recorder
     )) {
@@ -697,15 +727,6 @@ int APIENTRY WinMain(
             0,
             &blend_function,
             ULW_ALPHA
-        );
-
-        BitBlt(
-            window_device_context,
-            0, 0,
-            render_width, render_height,
-            render_device_context,
-            0, 0,
-            SRCCOPY
         );
 
         SelectObject(render_device_context, render_bitmap_old);
